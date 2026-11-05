@@ -839,15 +839,7 @@ impl WgpuWinitRunning<'_> {
         let vsync_secs = if is_visible {
             let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
 
-            let mut screenshot_commands = vec![];
-            viewport.actions_requested.retain(|cmd| {
-                if let ActionRequested::Screenshot(callback) = cmd {
-                    screenshot_commands.push(callback.clone());
-                    false
-                } else {
-                    true
-                }
-            });
+            let screenshot_commands = take_screenshot_commands(&mut viewport.actions_requested);
             let vsync_secs = painter.paint_and_update_textures(
                 viewport_id,
                 pixels_per_point,
@@ -1326,6 +1318,12 @@ fn render_immediate_viewport(
         }
     }
 
+    // Screenshots asked of this viewport (`ViewportCommand::Screenshot`, queued by an earlier
+    // pass's output) are taken from this paint, as the regular frame path does. Without this an
+    // immediate viewport (a second window drawn from its parent's pass) never answered one: the
+    // command stayed in `actions_requested` and its callback never ran.
+    let screenshot_commands = take_screenshot_commands(&mut viewport.actions_requested);
+
     let clipped_primitives = egui_ctx.tessellate(shapes, pixels_per_point);
     painter.paint_and_update_textures(
         ids.this,
@@ -1333,7 +1331,7 @@ fn render_immediate_viewport(
         [0.0, 0.0, 0.0, 0.0],
         &clipped_primitives,
         &mut viewport.pending_delta,
-        vec![],
+        screenshot_commands,
         window,
     );
 
@@ -1431,6 +1429,21 @@ fn handle_viewport_output(
     remove_viewports_not_in(viewports, painter, viewport_from_window, viewport_output);
 }
 
+/// Remove and return the screenshot callbacks among `actions`, in order, for the paint that takes
+/// them; the other actions stay, in order.
+fn take_screenshot_commands(actions: &mut Vec<ActionRequested>) -> Vec<egui::ScreenshotCallback> {
+    let mut screenshots = vec![];
+    actions.retain(|action| {
+        if let ActionRequested::Screenshot(callback) = action {
+            screenshots.push(callback.clone());
+            false
+        } else {
+            true
+        }
+    });
+    screenshots
+}
+
 /// Remove and return this viewport's `IMEAllowed` commands so they can be applied before
 /// platform output. Other commands keep their existing post-render processing order.
 fn take_ime_allowed_commands(
@@ -1519,5 +1532,36 @@ fn initialize_or_update_viewport<'a>(
 
             entry.into_mut()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ActionRequested, take_screenshot_commands};
+
+    /// An immediate viewport's paint takes the screenshots asked of it, as the regular frame
+    /// path does, and leaves the other actions in order (the second window of a multi-window
+    /// app answered no screenshot before: its callback never ran).
+    #[test]
+    fn screenshot_commands_are_taken_and_the_other_actions_kept() {
+        let shot = || ActionRequested::Screenshot(egui::ScreenshotCallback::new(|_| {}));
+        let mut actions = vec![
+            ActionRequested::Copy,
+            shot(),
+            ActionRequested::PaintWhileHidden,
+            shot(),
+            ActionRequested::Paste,
+        ];
+        let taken = take_screenshot_commands(&mut actions);
+        assert_eq!(taken.len(), 2);
+        assert!(matches!(
+            actions.as_slice(),
+            [
+                ActionRequested::Copy,
+                ActionRequested::PaintWhileHidden,
+                ActionRequested::Paste
+            ]
+        ));
+        assert!(take_screenshot_commands(&mut actions).is_empty());
     }
 }
